@@ -1,0 +1,338 @@
+name: Release Maven project (reusable)
+
+# Security model: callers get this by reference, not by copy -- see the
+# per-job comments below for what each job trusts and why. The credential
+# boundary (the maven-central-upload environment's required-reviewer
+# approval) lives in the CALLING repository, not here: reusable-workflow
+# jobs resolve `environment:` and `secrets:` against the caller, so this
+# shared repo never holds or sees any repo's Central/signing secrets itself.
+# Callers must pass secrets explicitly by name -- never `secrets: inherit`.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Semantic version to release, without a v prefix (e.g. 2.6.0 or 2.6.0-rc.1)"
+        required: true
+        type: string
+      development-version:
+        description: "Next development version (e.g. 2.6.1-SNAPSHOT). Leave empty to auto-derive the next patch SNAPSHOT."
+        required: false
+        type: string
+        default: ""
+      group-id:
+        description: "Maven groupId, e.g. io.zenwave360.sdk. Leave empty to derive it from pom.xml's <groupId> element instead of duplicating it here."
+        required: false
+        type: string
+        default: ""
+      artifact-id:
+        description: "Maven artifactId, e.g. zenwave-sdk. Leave empty to derive it from pom.xml's <artifactId> element instead of duplicating it here."
+        required: false
+        type: string
+        default: ""
+      java-version:
+        description: "JDK version for the build/prepare/publish steps"
+        required: false
+        type: string
+        default: "21"
+      java-distribution:
+        description: "JDK distribution (setup-java 'distribution' input)"
+        required: false
+        type: string
+        default: "temurin"
+      central-environment:
+        description: "Name of the GitHub Environment (in the caller repo) gating Central publication"
+        required: false
+        type: string
+        default: "maven-central-upload"
+      develop-branch:
+        description: "Branch to sync the release commit back into and to publish snapshots from"
+        required: false
+        type: string
+        default: "develop"
+      snapshot-workflow:
+        description: "Filename (in the caller repo's .github/workflows/) of the snapshot-publish workflow to dispatch after sync"
+        required: false
+        type: string
+        default: "publish-maven-snapshots.yml"
+    secrets:
+      CENTRAL_USERNAME:
+        required: true
+      CENTRAL_TOKEN:
+        required: true
+      SIGN_KEY:
+        required: true
+      SIGN_KEY_PASS:
+        required: true
+
+# Default deny: every job gets read-only unless it explicitly declares more.
+permissions:
+  contents: read
+
+# Only one release may run at a time, and a running release is never cancelled
+# -- see the caller's own concurrency group; this reusable workflow inherits
+# whatever group the caller's workflow_dispatch job established (concurrency
+# is not settable on workflow_call itself, so the caller's release-from-notes.yml
+# must declare its own `concurrency:` block).
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # validate: no secrets, read-only. See validate-release.yml.
+  # ---------------------------------------------------------------------------
+  validate:
+    # Same-repo reference: always resolves to the exact commit this caller
+    # workflow itself runs at, so there is no separate ref to pin or drift.
+    uses: ./.github/workflows/validate-release.yml
+    with:
+      version: ${{ inputs.version }}
+      development-version: ${{ inputs.development-version }}
+      group-id: ${{ inputs.group-id }}
+      artifact-id: ${{ inputs.artifact-id }}
+      publish-npm: false
+
+  # ---------------------------------------------------------------------------
+  # prepare-release: the ONLY job with contents:write/pull-requests:write before
+  # publication. Uses maven-release-plugin (release:prepare). Callers must
+  # configure <pushChanges>false</pushChanges> and
+  # <tagNameFormat>v@{project.version}</tagNameFormat> on maven-release-plugin
+  # in their own pom.xml -- release:prepare then only ever commits and tags
+  # LOCALLY, never pushing to main itself. peter-evans/create-pull-request
+  # picks up those local, unpushed commits, pushes them to a throwaway
+  # release/<version> branch, and opens the PR. That's the actual mechanism
+  # behind "commits to a tmp branch, merged via PR"; it depends on that pom.xml
+  # configuration existing in the caller repo, not on anything in this job.
+  #
+  # Why a PR instead of a direct push: main's ruleset requires changes to go
+  # through a pull request. A direct push would need a bypass actor added to
+  # that ruleset -- but ruleset bypass is granted to an IDENTITY (e.g. "GitHub
+  # Actions"), not to this one job. Any other workflow in the repo capable of
+  # authenticating as that identity would inherit the same bypass, which is a
+  # far bigger hole than this job's own blast radius. Merging a PR needs no
+  # bypass at all: it is the standard, already-allowed path, so this design
+  # adds no new privileged identity to the repository.
+  #
+  # The PR is merged immediately (`gh pr merge --merge`), not via GitHub's
+  # native `--auto` auto-merge, which requires the repo-level "Allow
+  # auto-merge" setting and otherwise fails with a GraphQL error. Immediate
+  # merge works because required approvals is 0 and main has no required
+  # status checks that only run on pull_request events, so the PR is already
+  # mergeable.
+  #
+  # Receives NO Central/signing secrets. Maven (release:prepare) is
+  # repository-controlled code and runs in this job, but never with
+  # publication secrets present.
+  # ---------------------------------------------------------------------------
+  prepare-release:
+    name: Create release commit and tag
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the release branch and the tag
+      pull-requests: write # open and merge the release PR
+    outputs:
+      release_commit_sha: ${{ steps.capture.outputs.release_commit_sha }}
+    steps:
+      # persist-credentials stays true (checkout's default) because the final
+      # "Push release tag" step below pushes with the token this step
+      # persists to the local git credential helper.
+      - name: Checkout trusted main commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+          fetch-depth: 0
+
+      - name: Refuse a stale release branch
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "release/${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Branch release/${VERSION} already exists on origin (leftover from a previous run?). Delete it and re-run."
+            exit 1
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: "maven"
+
+      - name: Configure Git User
+        run: |
+          git config user.email ${{ github.actor }}@users.noreply.github.com
+          git config user.name ${{ github.actor }}
+
+      - name: Prepare Release
+        run: |
+          mvn -B release:prepare -DreleaseVersion=${{ needs.validate.outputs.version }} -DdevelopmentVersion=${{ needs.validate.outputs.dev_version }}
+          mvn -B release:clean
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # release:prepare tagged the release commit locally (the caller's
+      # pom.xml must configure tagNameFormat=v@{project.version}) but has not
+      # pushed anything yet (pushChanges=false must also be pom-configured).
+      # Resolve the tag to a commit SHA now so downstream jobs can check out
+      # this exact, immutable commit later, regardless of what merge commit
+      # later lands on main.
+      - name: Capture release commit SHA
+        id: capture
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::release:prepare did not create tag ${TAG} locally. Check that pom.xml's maven-release-plugin sets tagNameFormat=v@{project.version}."
+            exit 1
+          fi
+          echo "release_commit_sha=$(git rev-list -n 1 "${TAG}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Create Pull Request (Main)
+        id: cpr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          base: main
+          commit-message: "Release ${{ needs.validate.outputs.version }}"
+          branch: release/${{ needs.validate.outputs.version }}
+          title: "Release ${{ needs.validate.outputs.version }}"
+          body: "Release ${{ needs.validate.outputs.version }}"
+          labels: "release"
+
+      - name: Merge Pull Request (Main)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge --merge --delete-branch "${{ steps.cpr.outputs.pull-request-number }}"
+
+      - name: Push Release Tag
+        run: git push --tags
+
+  # ---------------------------------------------------------------------------
+  # build-and-publish-central: builds and uploads the Maven Central deployment
+  # via the standard `mvn deploy` (central-publishing-maven-plugin extension
+  # handles staging; autoPublish=false must be configured in the caller's
+  # pom.xml, so this never auto-releases). Gated by the caller repo's
+  # `central-environment` (default 'maven-central-upload': required reviewer +
+  # deployments restricted to main) -- that approval before this job even
+  # starts is the actual credential boundary, resolved against the CALLING
+  # repository's environment configuration, not this shared repo's. Central
+  # tokens are not scoped per-operation, so a hand-rolled sign/zip/curl script
+  # would not stop a stolen token any better than this does; it just adds
+  # complexity for no real security gain.
+  #
+  # This job is not secretless: `mvn deploy` runs the full build lifecycle
+  # (compile, test, all configured plugins, all resolved dependencies) with
+  # all four secrets present. The "no build tool execution while secrets are
+  # present" goal holds only up to the environment-approval gate, not inside
+  # this job -- mitigated only by the fact that the code being built already
+  # passed required-PR review to land on main.
+  # ---------------------------------------------------------------------------
+  build-and-publish-central:
+    name: Build and publish Maven Central deployment (autoPublish=false)
+    needs: [validate, prepare-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: ${{ inputs.central-environment }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout immutable release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_commit_sha }}
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: "maven"
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.SIGN_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Build and publish to Maven Central (requires manual Publish in the Portal)
+        run: mvn --batch-mode deploy -DdeployAtEnd=true -Dmaven.javadoc.skip=false
+        env:
+          MAVEN_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.SIGN_KEY_PASS }}
+
+  # ---------------------------------------------------------------------------
+  # create-github-release: runs AFTER the Central upload succeeded, so a GitHub
+  # release is never announced for artifacts that failed to reach the Portal.
+  # Uses the committed release notes from the immutable release commit.
+  # ---------------------------------------------------------------------------
+  create-github-release:
+    name: Create GitHub release
+    needs: [validate, prepare-release, build-and-publish-central]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the GitHub release for the existing tag
+    steps:
+      - name: Checkout immutable release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_commit_sha }}
+          persist-credentials: false
+
+      - name: Create GitHub release from committed notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          NOTES_FILE: ${{ needs.validate.outputs.notes_file }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" --verify-tag \
+            --title "${TAG}" \
+            --notes-file "${NOTES_FILE}"
+
+  # ---------------------------------------------------------------------------
+  # sync-develop: post-release housekeeping. Merges the release version bumps
+  # from main back into the caller's develop branch and re-triggers snapshot
+  # publication. Receives no publication or signing secrets; runs entirely
+  # through the GitHub API.
+  # ---------------------------------------------------------------------------
+  sync-develop:
+    name: Sync main back to ${{ inputs.develop-branch }}
+    needs: [validate, create-github-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # merge the sync PR
+      pull-requests: write # create the sync PR
+      actions: write # dispatch the snapshot-publish workflow
+    steps:
+      - name: Create and merge sync PR, then trigger snapshot publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          DEVELOP_BRANCH: ${{ inputs.develop-branch }}
+          SNAPSHOT_WORKFLOW: ${{ inputs.snapshot-workflow }}
+        run: |
+          set -euo pipefail
+
+          AHEAD="$(gh api "repos/${GH_REPO}/compare/${DEVELOP_BRANCH}...main" --jq '.ahead_by')"
+          if [[ "${AHEAD}" == "0" ]]; then
+            echo "${DEVELOP_BRANCH} already contains main; nothing to sync."
+          else
+            PR_NUMBER="$(gh pr list --base "${DEVELOP_BRANCH}" --head main --state open --json number --jq '.[0].number // empty')"
+            if [[ -z "${PR_NUMBER}" ]]; then
+              PR_URL="$(gh pr create --base "${DEVELOP_BRANCH}" --head main \
+                --title "Sync main back to ${DEVELOP_BRANCH} after ${TAG}" \
+                --body "Syncs the ${TAG} release commit and next snapshot version back to ${DEVELOP_BRANCH}.")"
+              PR_NUMBER="${PR_URL##*/}"
+            fi
+            gh pr merge "${PR_NUMBER}" --merge
+          fi
+
+          # Pushes made with GITHUB_TOKEN do not trigger workflows, so snapshot
+          # publication for the new development version is dispatched explicitly.
+          gh workflow run "${SNAPSHOT_WORKFLOW}" --ref "${DEVELOP_BRANCH}"

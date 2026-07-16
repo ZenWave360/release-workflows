@@ -1,0 +1,309 @@
+name: Validate release (reusable)
+
+# Shared by release-maven.yml and release-gradle.yml. No secrets, read-only,
+# no build tool invoked -- git/grep/curl/jq only. Safe to share across every
+# repo in the org because it cannot leak anything: it never receives a
+# publication credential.
+#
+# Coordinates: group-id and artifact-id are optional inputs that, when left
+# empty, are derived from the checked-out source instead of being duplicated
+# in the caller's workflow file (the exact duplication that caused a real
+# drift bug: a Gradle repo's groupId was renamed in build.gradle.kts but the
+# workflow's copy of it wasn't updated, silently breaking the
+# duplicate-release check):
+#   - Gradle callers (build.gradle.kts present): group-id is read from that
+#     file's `group = "..."` line. artifact-id is NOT auto-derived for
+#     Gradle -- there is no single canonical field for it the way Maven has
+#     <artifactId> (it usually defaults to rootProject.name in a separate
+#     settings.gradle.kts file, which isn't authoritative for every layout)
+#     -- pass it explicitly.
+#   - Maven callers (pom.xml present): both group-id and artifact-id are
+#     read from pom.xml's root <project> element (falling back to
+#     <project><parent><groupId> if groupId isn't declared directly), using
+#     Python's XML parser scoped to direct children only -- never a plain
+#     grep, since every <dependency> also declares its own <groupId>.
+#
+# The Maven Central path is derived from group-id/artifact-id the standard
+# way (dots in groupId -> slashes). Getting either wrong just makes the
+# duplicate-release check a false negative (an already-published version
+# would slip through as "not found"), so if you do pass them explicitly,
+# double check against an actual published URL, not just the source file.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Semantic version to release, without a v prefix (e.g. 1.0.0 or 1.0.0-rc.1)"
+        required: true
+        type: string
+      development-version:
+        description: "Next development version (e.g. 1.0.1-SNAPSHOT). Leave empty to auto-derive the next patch SNAPSHOT."
+        required: false
+        type: string
+        default: ""
+      group-id:
+        description: "Maven groupId, e.g. io.zenwave360.sdk. Leave empty for Gradle callers with a build.gradle.kts -- it is read from that file's 'group = ...' line instead. Required for Maven callers (no build.gradle.kts to read it from)."
+        required: false
+        type: string
+        default: ""
+      artifact-id:
+        description: "Maven artifactId, e.g. zenwave-sdk. Leave empty for Maven callers with a pom.xml -- it is read from that file's <artifactId> element instead. Required for Gradle callers (not reliably derivable)."
+        required: false
+        type: string
+        default: ""
+      publish-npm:
+        description: "Whether this release may publish to npm (irrelevant for Maven-only repos; pass false)"
+        required: false
+        type: boolean
+        default: false
+      npm-package:
+        description: "npm package name including scope, e.g. @zenwave360/json-schema-ref-parser-kmp. Required if publish-npm can be true."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      release_sha:
+        description: "The trusted commit SHA on main, captured once at dispatch"
+        value: ${{ jobs.validate.outputs.release_sha }}
+      version:
+        description: "Validated release version"
+        value: ${{ jobs.validate.outputs.version }}
+      tag:
+        description: "Release tag (vX.Y.Z)"
+        value: ${{ jobs.validate.outputs.tag }}
+      notes_file:
+        description: "Path to the validated release notes file"
+        value: ${{ jobs.validate.outputs.notes_file }}
+      dev_version:
+        description: "Next development (SNAPSHOT) version"
+        value: ${{ jobs.validate.outputs.dev_version }}
+      publish_npm:
+        description: "Echoes the publish-npm input back out as a job output, for consistency with the other outputs"
+        value: ${{ jobs.validate.outputs.publish_npm }}
+
+jobs:
+  validate:
+    name: Validate version, notes and trusted commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      release_sha: ${{ steps.capture.outputs.release_sha }}
+      version: ${{ steps.capture.outputs.version }}
+      tag: ${{ steps.capture.outputs.tag }}
+      notes_file: ${{ steps.capture.outputs.notes_file }}
+      dev_version: ${{ steps.capture.outputs.dev_version }}
+      publish_npm: ${{ steps.capture.outputs.publish_npm }}
+    steps:
+      - name: Require dispatch from the default branch (main)
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Release must be dispatched from 'main'. Got '${GITHUB_REF}'."
+          exit 1
+
+      # github.sha is the tip of main captured once at dispatch time; it does
+      # not move if main receives new pushes, and it is stable across reruns.
+      - name: Checkout trusted main commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate inputs, release notes and duplicate protection
+        id: capture
+        env:
+          # Inputs are passed via env (never interpolated into script source)
+          # and validated against a strict pattern before any other use.
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DEV_VERSION: ${{ inputs.development-version }}
+          INPUT_PUBLISH_NPM: ${{ inputs.publish-npm }}
+          GROUP_ID: ${{ inputs.group-id }}
+          ARTIFACT_ID: ${{ inputs.artifact-id }}
+          NPM_PACKAGE: ${{ inputs.npm-package }}
+          RELEASE_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # --- version policy: X.Y.Z or X.Y.Z-rc.N, no 'v' prefix ---
+          if [[ ! "${INPUT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::version must match X.Y.Z or X.Y.Z-rc.N (e.g. 1.0.0, 1.0.0-rc.1). Got '${INPUT_VERSION}'."
+            exit 1
+          fi
+          VERSION="${INPUT_VERSION}"
+          TAG="v${VERSION}"
+
+          # --- next development version: X.Y.Z-SNAPSHOT, auto-derived if empty ---
+          if [[ -z "${INPUT_DEV_VERSION}" ]]; then
+            BASE="${VERSION%%-*}"
+            MAJOR="${BASE%%.*}"; REST="${BASE#*.}"; MINOR="${REST%%.*}"; PATCH="${REST#*.}"
+            if [[ "${VERSION}" == *-rc.* ]]; then
+              DEV_VERSION="${BASE}-SNAPSHOT"
+            else
+              DEV_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))-SNAPSHOT"
+            fi
+          else
+            DEV_VERSION="${INPUT_DEV_VERSION}"
+          fi
+          if [[ ! "${DEV_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT$ ]]; then
+            echo "::error::developmentVersion must match X.Y.Z-SNAPSHOT. Got '${DEV_VERSION}'."
+            exit 1
+          fi
+
+          if [[ "${INPUT_PUBLISH_NPM}" != "true" && "${INPUT_PUBLISH_NPM}" != "false" ]]; then
+            echo "::error::publish-npm must be true or false."
+            exit 1
+          fi
+          if [[ "${INPUT_PUBLISH_NPM}" == "true" && -z "${NPM_PACKAGE}" ]]; then
+            echo "::error::publish-npm is true but npm-package was not provided."
+            exit 1
+          fi
+          # Derive whichever of group-id/artifact-id the caller left empty,
+          # from the checked-out source rather than requiring it be
+          # duplicated in the caller's workflow file.
+          if [[ -z "${GROUP_ID}" && -f build.gradle.kts ]]; then
+            if [[ "$(grep -c '^group = ' build.gradle.kts)" != "1" ]]; then
+              echo "::error::Expected exactly one top-level 'group = ' line in build.gradle.kts to derive group-id from."
+              exit 1
+            fi
+            GROUP_ID="$(grep -oP '^group = "\K[^"]+' build.gradle.kts)"
+            echo "Derived group-id from build.gradle.kts: ${GROUP_ID}"
+          fi
+
+          if [[ ( -z "${GROUP_ID}" || -z "${ARTIFACT_ID}" ) && -f pom.xml ]]; then
+            # Parsed with Python's XML tree, scoped to direct children of
+            # <project> (falling back to <project><parent> for groupId) --
+            # never a plain grep, since every <dependency> also declares
+            # its own <groupId>/<artifactId>.
+            POM_COORDS="$(python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          def strip_ns(tag):
+              return tag.split("}", 1)[-1] if "}" in tag else tag
+
+          def find_child(elem, name):
+              for child in elem:
+                  if strip_ns(child.tag) == name:
+                      return child
+              return None
+
+          root = ET.parse("pom.xml").getroot()
+
+          group_id_el = find_child(root, "groupId")
+          if group_id_el is None:
+              parent = find_child(root, "parent")
+              if parent is not None:
+                  group_id_el = find_child(parent, "groupId")
+          artifact_id_el = find_child(root, "artifactId")
+
+          group_id = group_id_el.text.strip() if group_id_el is not None and group_id_el.text else ""
+          artifact_id = artifact_id_el.text.strip() if artifact_id_el is not None and artifact_id_el.text else ""
+
+          print(f"{group_id} {artifact_id}")
+          PY
+          )"
+            POM_GROUP_ID="${POM_COORDS%% *}"
+            POM_ARTIFACT_ID="${POM_COORDS##* }"
+            if [[ -z "${GROUP_ID}" ]]; then
+              GROUP_ID="${POM_GROUP_ID}"
+              echo "Derived group-id from pom.xml: ${GROUP_ID}"
+            fi
+            if [[ -z "${ARTIFACT_ID}" ]]; then
+              ARTIFACT_ID="${POM_ARTIFACT_ID}"
+              echo "Derived artifact-id from pom.xml: ${ARTIFACT_ID}"
+            fi
+          fi
+
+          if [[ -z "${GROUP_ID}" || -z "${ARTIFACT_ID}" ]]; then
+            echo "::error::group-id and artifact-id are required (could not be derived from build.gradle.kts or pom.xml)."
+            exit 1
+          fi
+          if [[ ! "${GROUP_ID}" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            echo "::error::group-id contains characters not valid in a Maven groupId: '${GROUP_ID}'."
+            exit 1
+          fi
+          if [[ ! "${ARTIFACT_ID}" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            echo "::error::artifact-id contains characters not valid in a Maven artifactId: '${ARTIFACT_ID}'."
+            exit 1
+          fi
+          # Maven Central lays groupId out as a path with dots replaced by slashes.
+          CENTRAL_ARTIFACT_PATH="$(printf '%s' "${GROUP_ID}" | tr '.' '/')/${ARTIFACT_ID}"
+
+          # --- trusted commit must be reachable from origin/main ---
+          if ! git merge-base --is-ancestor "${RELEASE_SHA}" origin/main; then
+            echo "::error::Captured commit ${RELEASE_SHA} is not reachable from origin/main."
+            exit 1
+          fi
+
+          # --- release notes: deterministic path derived from the validated version ---
+          NOTES_FILE="release-notes/release-notes.v${VERSION}.md"
+          if [[ -L "${NOTES_FILE}" ]]; then
+            echo "::error::Release notes ${NOTES_FILE} must not be a symlink."
+            exit 1
+          fi
+          if [[ ! -f "${NOTES_FILE}" || ! -s "${NOTES_FILE}" ]]; then
+            echo "::error::Missing or empty release notes: ${NOTES_FILE}. Commit them to main before releasing."
+            exit 1
+          fi
+          if ! grep -qF "${VERSION}" "${NOTES_FILE}"; then
+            echo "::error::${NOTES_FILE} never mentions '${VERSION}'. Are these the notes for this release?"
+            exit 1
+          fi
+
+          # --- duplicate release protection ---
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists locally."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin."
+            exit 1
+          fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::GitHub release ${TAG} already exists."
+            exit 1
+          fi
+          HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://repo1.maven.org/maven2/${CENTRAL_ARTIFACT_PATH}/${VERSION}/")"
+          if [[ "${HTTP_CODE}" != "404" ]]; then
+            echo "::error::Version ${VERSION} appears already published on Maven Central (HTTP ${HTTP_CODE}, checked https://repo1.maven.org/maven2/${CENTRAL_ARTIFACT_PATH}/${VERSION}/)."
+            exit 1
+          fi
+
+          # --- npm pre-flight (only when npm publication is requested) ---
+          if [[ "${INPUT_PUBLISH_NPM}" == "true" ]]; then
+            NPM_PACKAGE_URLENC="$(printf '%s' "${NPM_PACKAGE}" | sed 's#/#%2F#g')"
+            NPM_META_FILE="$(mktemp)"
+            NPM_CODE="$(curl -sS -o "${NPM_META_FILE}" -w '%{http_code}' \
+              "https://registry.npmjs.org/${NPM_PACKAGE_URLENC}")"
+            if [[ "${NPM_CODE}" != "200" ]]; then
+              echo "::error::${NPM_PACKAGE} does not exist on registry.npmjs.org (HTTP ${NPM_CODE})."
+              echo "::error::OIDC trusted publishing requires an existing package: the FIRST publish is manual."
+              exit 1
+            fi
+            if ! jq --arg v "${VERSION}" -e '.versions[$v] | not' "${NPM_META_FILE}" >/dev/null; then
+              echo "::error::${NPM_PACKAGE}@${VERSION} is already published on npm."
+              exit 1
+            fi
+            rm -f "${NPM_META_FILE}"
+          fi
+
+          {
+            echo "release_sha=${RELEASE_SHA}"
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "notes_file=${NOTES_FILE}"
+            echo "dev_version=${DEV_VERSION}"
+            echo "publish_npm=${INPUT_PUBLISH_NPM}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Release v${VERSION}"
+            echo "- Trusted main commit: \`${RELEASE_SHA}\`"
+            echo "- Tag: \`${TAG}\`"
+            echo "- Release notes: \`${NOTES_FILE}\`"
+            echo "- Next development version: \`${DEV_VERSION}\`"
+            echo "- npm publication: \`${INPUT_PUBLISH_NPM}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,167 @@
+name: Publish Gradle snapshot (reusable)
+
+# Security model: see release-maven.yml/release-gradle.yml's headers -- same
+# principle. `environment:` and `secrets:` resolve against the CALLING
+# repository. Callers pass secrets explicitly by name -- never
+# `secrets: inherit`.
+#
+# This reusable workflow has no `on:` trigger of its own (workflow_call
+# reusable workflows can't also declare push/schedule triggers that would
+# fire in THIS repo) -- the caller keeps its own thin
+# `publish-maven-snapshots.yml` with `on: push: branches: [develop, next]`
+# and calls this as a single job. The branch check below is defense in
+# depth on top of the caller's trigger filter and the environment's
+# deployment branch policy (the actual hard boundary).
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        required: false
+        type: string
+        default: "17"
+      java-distribution:
+        required: false
+        type: string
+        default: "temurin"
+      node-version:
+        required: false
+        type: string
+        default: "18"
+      snapshot-environment:
+        description: "Name of the GitHub Environment (in the caller repo) gating snapshot publication"
+        required: false
+        type: string
+        default: "maven-central-snapshots"
+      develop-branch:
+        required: false
+        type: string
+        default: "develop"
+      next-branch:
+        required: false
+        type: string
+        default: "next"
+    secrets:
+      CENTRAL_USERNAME:
+        required: true
+      CENTRAL_TOKEN:
+        required: true
+      SIGN_KEY:
+        required: true
+      SIGN_KEY_PASS:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish-snapshot:
+    name: Build, test and publish snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Defense in depth; the environment branch policy is the hard boundary.
+    if: github.ref == format('refs/heads/{0}', inputs.develop-branch) || github.ref == format('refs/heads/{0}', inputs.next-branch)
+    environment: ${{ inputs.snapshot-environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The committed gradle-wrapper.jar is executable code: verify its
+      # checksum against Gradle's published checksums before running it.
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+
+      - name: Set up JDK
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: "gradle"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Guard against accidentally publishing a release version as a snapshot.
+      # Runs without secrets in the environment.
+      - name: Enforce snapshot version
+        run: |
+          set -euo pipefail
+          if ! grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT"$' build.gradle.kts; then
+            echo "::error::build.gradle.kts version is not a -SNAPSHOT; refusing to publish a snapshot."
+            grep '^version = ' build.gradle.kts || true
+            exit 1
+          fi
+
+      - name: Build and test with coverage
+        run: |
+          chmod +x gradlew
+          ./gradlew build koverHtmlReport koverXmlReport koverLog
+
+      - name: Extract coverage metrics
+        if: always()
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("build/reports/kover/report.xml")
+          root = ET.parse(report).getroot()
+
+          metrics = {}
+          for counter in root.findall("counter"):
+              counter_type = counter.attrib["type"]
+              missed = int(counter.attrib["missed"])
+              covered = int(counter.attrib["covered"])
+              total = covered + missed
+              percent = 100.0 * covered / total if total else 0.0
+              metrics[counter_type] = round(percent)
+
+          github_env = Path(os.environ["GITHUB_ENV"])
+          with github_env.open("a", encoding="utf-8") as env:
+              env.write(f"LINE_COVERAGE={metrics.get('LINE', 0)}\n")
+              env.write(f"BRANCH_COVERAGE={metrics.get('BRANCH', 0)}\n")
+          PY
+
+      - name: Print coverage to console
+        if: always()
+        run: |
+          echo "line coverage = ${LINE_COVERAGE}%"
+          echo "branch coverage = ${BRANCH_COVERAGE}%"
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          {
+            echo "## Kover Test Coverage Summary"
+            echo
+            echo "- Coverage: ${LINE_COVERAGE}%"
+            echo "- Branches: ${BRANCH_COVERAGE}%"
+            echo "- Generated by: Kover XML report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: coverage-reports
+          path: |
+            build/reports/kover/
+            build/reports/tests/
+
+      # Secrets are scoped to this single step. Everything Gradle runs here
+      # (plugins, dependencies, Kotlin/JS tooling) executes with the snapshot
+      # credentials present -- that is the documented residual risk of
+      # snapshot publishing.
+      - name: Publish snapshots to Maven Central
+        run: ./gradlew publishToMavenCentral
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_TOKEN }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGN_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGN_KEY_PASS }}

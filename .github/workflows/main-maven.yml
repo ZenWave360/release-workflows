@@ -1,0 +1,97 @@
+name: Verify main and publish coverage badges (Maven, reusable)
+
+# No secrets: this workflow only ever runs on push to the caller's protected
+# `main` (or manual dispatch), and pushes generated coverage badges back to
+# the caller's own `badges` branch using the default GITHUB_TOKEN --
+# nothing here ever touches Central/npm/signing credentials.
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        required: false
+        type: string
+        default: "21"
+      java-distribution:
+        required: false
+        type: string
+        default: "temurin"
+      badges-branch:
+        description: "Branch (in the caller repo) that coverage badge SVGs/JaCoCo reports are committed to"
+        required: false
+        type: string
+        default: "badges"
+      jacoco-csv-files:
+        description: "Newline- or space-separated list of jacoco.csv paths (one per module) to feed the badge generator. Defaults to the standard single-module Maven layout; multi-module repos must override with their per-module list."
+        required: false
+        type: string
+        default: "./target/site/jacoco/jacoco.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Verify and publish coverage badges
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # push generated badges/reports to the badges branch
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Java
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: "maven"
+
+      - name: Verify and publish coverage
+        run: mvn verify
+
+      - name: Checkout badges branch to a badges directory nested inside first checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.badges-branch }}
+          path: badges
+
+      - name: Generate JaCoCo badge
+        id: jacoco
+        uses: cicirello/jacoco-badge-generator@72266185b7ee48a6fd74eaf0238395cc8b14fef8 # v2.12.1
+        with:
+          badges-directory: badges
+          generate-branches-badge: true
+          generate-summary: true
+          jacoco-csv-file: ${{ inputs.jacoco-csv-files }}
+
+      - name: Log coverage percentage
+        run: |
+          echo "coverage = ${{ steps.jacoco.outputs.coverage }}"
+          echo "branch coverage = ${{ steps.jacoco.outputs.branches }}"
+
+      - name: Pack JaCoCo reports
+        run: |
+          set -euo pipefail
+          rm -rf badges/jacoco
+          mkdir -p badges/jacoco
+          echo "GROUP,PACKAGE,CLASS,INSTRUCTION_MISSED,INSTRUCTION_COVERED,BRANCH_MISSED,BRANCH_COVERED,LINE_MISSED,LINE_COVERED,COMPLEXITY_MISSED,COMPLEXITY_COVERED,METHOD_MISSED,METHOD_COVERED" > badges/jacoco-report.csv
+          find . -name 'jacoco.csv' -exec sed '1d' {} \; >> badges/jacoco-report.csv
+          find . \( -name jacoco.csv -o -name jacoco.exec -o -name jacoco.xml \) -print0 | tar -c --null -T - | tar -C badges/jacoco -x
+
+      - name: Commit and push the coverage badges and summary file
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          BADGES_BRANCH: ${{ inputs.badges-branch }}
+          COVERAGE: ${{ steps.jacoco.outputs.coverage }}
+          BRANCHES: ${{ steps.jacoco.outputs.branches }}
+        run: |
+          set -euo pipefail
+          cd badges
+          if [[ $(git status --porcelain) ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add ./*.svg ./*.json jacoco-report.csv jacoco/*
+            git commit -m "coverage = ${COVERAGE} branches = ${BRANCHES}"
+            git push origin "HEAD:${BADGES_BRANCH}"
+          fi

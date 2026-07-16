@@ -1,0 +1,161 @@
+name: Verify main and publish coverage badges (Gradle, reusable)
+
+# No secrets: this workflow only ever runs on push to the caller's protected
+# `main` (or manual dispatch), and pushes generated coverage badges back to
+# the caller's own `badges` branch using the default GITHUB_TOKEN --
+# nothing here ever touches Central/npm/signing credentials.
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        required: false
+        type: string
+        default: "17"
+      java-distribution:
+        required: false
+        type: string
+        default: "temurin"
+      node-version:
+        required: false
+        type: string
+        default: "18"
+      badges-branch:
+        description: "Branch (in the caller repo) that coverage badge SVGs are committed to"
+        required: false
+        type: string
+        default: "badges"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test and publish coverage badges
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push generated badges to the badges branch
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # The committed gradle-wrapper.jar is executable code: verify its
+      # checksum against Gradle's published checksums before running it.
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+
+      - name: Set up JDK
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: "gradle"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build and test with coverage
+        run: |
+          chmod +x gradlew
+          ./gradlew build koverHtmlReport koverXmlReport koverLog
+
+      - name: Extract coverage metrics
+        if: always()
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path("build/reports/kover/report.xml")
+          root = ET.parse(report).getroot()
+
+          metrics = {}
+          for counter in root.findall("counter"):
+              counter_type = counter.attrib["type"]
+              missed = int(counter.attrib["missed"])
+              covered = int(counter.attrib["covered"])
+              total = covered + missed
+              percent = 100.0 * covered / total if total else 0.0
+              metrics[counter_type] = round(percent)
+
+          github_env = Path(os.environ["GITHUB_ENV"])
+          with github_env.open("a", encoding="utf-8") as env:
+              env.write(f"LINE_COVERAGE={metrics.get('LINE', 0)}\n")
+              env.write(f"BRANCH_COVERAGE={metrics.get('BRANCH', 0)}\n")
+          PY
+
+      - name: Print coverage to console
+        if: always()
+        run: |
+          echo "line coverage = ${LINE_COVERAGE}%"
+          echo "branch coverage = ${BRANCH_COVERAGE}%"
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: coverage-reports
+          path: |
+            build/reports/kover/
+            build/reports/tests/
+
+      - name: Checkout badges branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          ref: ${{ inputs.badges-branch }}
+          path: badges
+
+      - name: Generate coverage badges
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+
+          echo "Line Coverage: ${LINE_COVERAGE}%"
+          echo "Branch Coverage: ${BRANCH_COVERAGE}%"
+
+          if [ "${LINE_COVERAGE}" -ge 80 ]; then
+            LINE_COLOR="brightgreen"
+          elif [ "${LINE_COVERAGE}" -ge 60 ]; then
+            LINE_COLOR="yellow"
+          else
+            LINE_COLOR="red"
+          fi
+
+          if [ "${BRANCH_COVERAGE}" -ge 80 ]; then
+            BRANCH_COLOR="brightgreen"
+          elif [ "${BRANCH_COVERAGE}" -ge 60 ]; then
+            BRANCH_COLOR="yellow"
+          else
+            BRANCH_COLOR="red"
+          fi
+
+          mkdir -p badges
+
+          curl -fsSL -o badges/coverage.svg "https://img.shields.io/badge/line%20coverage-${LINE_COVERAGE}%25-${LINE_COLOR}"
+          curl -fsSL -o badges/branches.svg "https://img.shields.io/badge/branch%20coverage-${BRANCH_COVERAGE}%25-${BRANCH_COLOR}"
+
+      - name: Commit and push coverage badges
+        if: github.event_name != 'pull_request'
+        env:
+          BADGES_BRANCH: ${{ inputs.badges-branch }}
+        run: |
+          set -euo pipefail
+          cd badges
+          if [[ $(git status --porcelain) ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add coverage.svg branches.svg
+            git commit -m "Update coverage badges: line ${LINE_COVERAGE}%, branch ${BRANCH_COVERAGE}%"
+            git push origin "HEAD:${BADGES_BRANCH}"
+          fi
+
+      - name: Log coverage percentage
+        run: |
+          echo "line coverage = ${LINE_COVERAGE}"
+          echo "branch coverage = ${BRANCH_COVERAGE}"
