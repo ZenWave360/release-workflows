@@ -106,11 +106,20 @@ jobs:
           set -euo pipefail
 
           python - <<'PY'
+          import glob
           import os
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          report = Path("build/reports/kover/report.xml")
+          # Glob rather than a fixed root-relative path: works for both a
+          # flat single-module layout (./build/reports/kover/report.xml) and
+          # a project with the publishable module in a subproject
+          # (./manifest-core/build/reports/kover/report.xml), with no
+          # per-repo path input needed.
+          matches = glob.glob("**/build/reports/kover/report.xml", recursive=True)
+          if not matches:
+              raise SystemExit("No build/reports/kover/report.xml found anywhere in the checkout.")
+          report = Path(matches[0])
           root = ET.parse(report).getroot()
 
           metrics = {}
@@ -151,8 +160,8 @@ jobs:
         with:
           name: coverage-reports
           path: |
-            build/reports/kover/
-            build/reports/tests/
+            **/build/reports/kover/
+            **/build/reports/tests/
 
       # Secrets are scoped to this single step. Everything Gradle runs here
       # (plugins, dependencies, Kotlin/JS tooling) executes with the snapshot
