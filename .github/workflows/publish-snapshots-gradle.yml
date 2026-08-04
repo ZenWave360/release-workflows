@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: "next"
+      kover-xml-files:
+        description: "Newline- or space-separated list of Kover report.xml paths (one per module) to feed the badge generator. Defaults to the standard single-module Gradle layout; multi-module repos must override with their per-module list."
+        required: false
+        type: string
+        default: "./build/reports/kover/report.xml"
     secrets:
       CENTRAL_USERNAME:
         required: true
@@ -102,39 +107,45 @@ jobs:
 
       - name: Extract coverage metrics
         if: always()
+        env:
+          KOVER_XML_FILES: ${{ inputs.kover-xml-files }}
         run: |
           set -euo pipefail
 
           python - <<'PY'
-          import glob
           import os
           import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          # Glob rather than a fixed root-relative path: works for both a
-          # flat single-module layout (./build/reports/kover/report.xml) and
-          # a project with the publishable module in a subproject
-          # (./manifest-core/build/reports/kover/report.xml), with no
-          # per-repo path input needed.
-          matches = glob.glob("**/build/reports/kover/report.xml", recursive=True)
-          if not matches:
-              raise SystemExit("No build/reports/kover/report.xml found anywhere in the checkout.")
-          report = Path(matches[0])
-          root = ET.parse(report).getroot()
-
           metrics = {}
-          for counter in root.findall("counter"):
-              counter_type = counter.attrib["type"]
-              missed = int(counter.attrib["missed"])
-              covered = int(counter.attrib["covered"])
+          reports = [Path(path) for path in os.environ["KOVER_XML_FILES"].split()]
+          if not reports:
+              raise SystemExit("KOVER_XML_FILES must name at least one Kover XML report.")
+
+          missing_reports = [str(path) for path in reports if not path.is_file()]
+          if missing_reports:
+              raise SystemExit("Missing Kover XML report(s): " + ", ".join(missing_reports))
+
+          for report in reports:
+              root = ET.parse(report).getroot()
+              for counter in root.findall("counter"):
+                  counter_type = counter.attrib["type"]
+                  totals = metrics.setdefault(counter_type, {"missed": 0, "covered": 0})
+                  totals["missed"] += int(counter.attrib["missed"])
+                  totals["covered"] += int(counter.attrib["covered"])
+
+          percentages = {}
+          for counter_type, totals in metrics.items():
+              missed = totals["missed"]
+              covered = totals["covered"]
               total = covered + missed
               percent = 100.0 * covered / total if total else 0.0
-              metrics[counter_type] = round(percent)
+              percentages[counter_type] = round(percent)
 
           github_env = Path(os.environ["GITHUB_ENV"])
           with github_env.open("a", encoding="utf-8") as env:
-              env.write(f"LINE_COVERAGE={metrics.get('LINE', 0)}\n")
-              env.write(f"BRANCH_COVERAGE={metrics.get('BRANCH', 0)}\n")
+              env.write(f"LINE_COVERAGE={percentages.get('LINE', 0)}\n")
+              env.write(f"BRANCH_COVERAGE={percentages.get('BRANCH', 0)}\n")
           PY
 
       - name: Print coverage to console
