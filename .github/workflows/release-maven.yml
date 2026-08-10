@@ -95,11 +95,11 @@ jobs:
   # configure <pushChanges>false</pushChanges> and
   # <tagNameFormat>v@{project.version}</tagNameFormat> on maven-release-plugin
   # in their own pom.xml -- release:prepare then only ever commits and tags
-  # LOCALLY, never pushing to main itself. peter-evans/create-pull-request
-  # picks up those local, unpushed commits, pushes them to a throwaway
-  # release/<version> branch, and opens the PR. That's the actual mechanism
-  # behind "commits to a tmp branch, merged via PR"; it depends on that pom.xml
-  # configuration existing in the caller repo, not on anything in this job.
+  # LOCALLY, never pushing to main itself. This job explicitly pushes detached
+  # HEAD to a throwaway release/<version> branch, opens a PR with gh, and merges
+  # it. That's the actual mechanism behind "commits to a tmp branch, merged via
+  # PR"; it depends on that pom.xml configuration existing in the caller repo,
+  # not on anything else in this job.
   #
   # Why a PR instead of a direct push: main's ruleset requires changes to go
   # through a pull request. A direct push would need a bypass actor added to
@@ -132,14 +132,12 @@ jobs:
     outputs:
       release_commit_sha: ${{ steps.capture.outputs.release_commit_sha }}
     steps:
-      # persist-credentials stays true (checkout's default) because the final
-      # "Push release tag" step below pushes with the token this step
-      # persists to the local git credential helper.
       - name: Checkout trusted main commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.validate.outputs.release_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Refuse a stale release branch
         env:
@@ -189,24 +187,97 @@ jobs:
           fi
           echo "release_commit_sha=$(git rev-list -n 1 "${TAG}")" >> "${GITHUB_OUTPUT}"
 
-      - name: Create Pull Request (Main)
-        id: cpr
-        uses: peter-evans/create-pull-request@v5
-        with:
-          base: main
-          commit-message: "Release ${{ needs.validate.outputs.version }}"
-          branch: release/${{ needs.validate.outputs.version }}
-          title: "Release ${{ needs.validate.outputs.version }}"
-          body: "Release ${{ needs.validate.outputs.version }}"
-          labels: "release"
+      # Push credentials are scoped to this step rather than persisted by
+      # actions/checkout in the local Git credential helper.
+      - name: Push release branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
 
-      - name: Merge Pull Request (Main)
+          ASKPASS="$(mktemp)"
+          trap 'rm -f "${ASKPASS}"' EXIT
+          printf '#!/bin/sh\nprintf %%s "${GITHUB_TOKEN}"\n' > "${ASKPASS}"
+          chmod 700 "${ASKPASS}"
+
+          GIT_ASKPASS="${ASKPASS}" git push \
+            "https://x-access-token@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/release/${VERSION}"
+
+      - name: Open and merge release PR
+        id: pr
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr merge --merge --delete-branch "${{ steps.cpr.outputs.pull-request-number }}"
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PR_URL="$(gh pr create --base main --head "release/${VERSION}" \
+            --title "chore(release): ${VERSION}" \
+            --body "Automated release commit and next-development version bump for ${TAG}. This PR is required because main is protected; once merged, the release continues automatically." \
+            --label "release")"
+          PR_NUMBER="${PR_URL##*/}"
+          echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+          # Merge immediately rather than requesting GitHub's native auto-merge
+          # (which requires the repo-level "Allow auto-merge" setting and
+          # would otherwise just fail with a GraphQL error). This works because
+          # required approvals is 0 and main has no required status checks that
+          # only run on pull_request events, so the PR is already mergeable.
+          gh pr merge "${PR_NUMBER}" --merge --delete-branch
 
-      - name: Push Release Tag
-        run: git push --tags
+      # Safety net: the merge above is normally synchronous, but this confirms
+      # it actually landed (e.g. if a merge queue or delayed check deferred
+      # it) and fails fast on a real conflict or on the PR being closed
+      # unmerged, instead of spinning for the full timeout.
+      - name: Wait for release PR to merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          ELAPSED=0
+          TIMEOUT=900
+          while true; do
+            STATE="$(gh pr view "${PR_NUMBER}" --json state --jq '.state')"
+            if [[ "${STATE}" == "MERGED" ]]; then
+              break
+            fi
+            if [[ "${STATE}" == "CLOSED" ]]; then
+              echo "::error::Release PR #${PR_NUMBER} was closed without merging."
+              exit 1
+            fi
+            MERGEABLE="$(gh pr view "${PR_NUMBER}" --json mergeable --jq '.mergeable')"
+            if [[ "${MERGEABLE}" == "CONFLICTING" ]]; then
+              echo "::error::Release PR #${PR_NUMBER} conflicts with main. Resolve manually and re-run the release."
+              exit 1
+            fi
+            if (( ELAPSED >= TIMEOUT )); then
+              echo "::error::Timed out waiting for release PR #${PR_NUMBER} to merge (state=${STATE}). Check required status checks / branch protection."
+              exit 1
+            fi
+            sleep 15
+            ELAPSED=$((ELAPSED + 15))
+          done
+
+      # Only pushed after the release commit is confirmed to be reachable from
+      # main via the merge, so the tag can never point at unmerged content.
+      - name: Push release tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ASKPASS="$(mktemp)"
+          trap 'rm -f "${ASKPASS}"' EXIT
+          printf '#!/bin/sh\nprintf %%s "${GITHUB_TOKEN}"\n' > "${ASKPASS}"
+          chmod 700 "${ASKPASS}"
+
+          GIT_ASKPASS="${ASKPASS}" git push \
+            "https://x-access-token@github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${TAG}"
 
   # ---------------------------------------------------------------------------
   # build-and-publish-central: builds and uploads the Maven Central deployment
