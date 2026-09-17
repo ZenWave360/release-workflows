@@ -45,6 +45,27 @@ on:
         required: false
         type: string
         default: "./build/reports/kover/report.xml"
+      publish-npm:
+        description: "Publish a unique npm prerelease to next after Maven snapshot publication"
+        required: false
+        type: boolean
+        default: false
+      npm-package:
+        required: false
+        type: string
+        default: ""
+      npm-package-dir:
+        required: false
+        type: string
+        default: ""
+      npm-environment:
+        required: false
+        type: string
+        default: "npm-snapshots"
+      npm-node-version:
+        required: false
+        type: string
+        default: "24"
     secrets:
       CENTRAL_USERNAME:
         required: true
@@ -185,3 +206,76 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_TOKEN }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGN_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGN_KEY_PASS }}
+
+  publish-npm-snapshot:
+    name: Publish npm snapshot to next
+    needs: publish-snapshot
+    if: inputs.publish-npm && (github.ref == format('refs/heads/{0}', inputs.develop-branch) || github.ref == format('refs/heads/{0}', inputs.next-branch))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.npm-environment }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: npm-snapshots-${{ inputs.npm-package }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+
+      - name: Set up JDK
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+
+      - name: Set up Node.js for trusted publishing
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.npm-node-version }}
+          registry-url: https://registry.npmjs.org/
+
+      - name: Build and test a unique npm snapshot
+        env:
+          SNAPSHOT_BUILD: ${{ github.run_number }}.${{ github.run_attempt }}
+          NPM_PACKAGE: ${{ inputs.npm-package }}
+          PKG_DIR: ${{ inputs.npm-package-dir }}
+        run: |
+          set -euo pipefail
+          test -n "${NPM_PACKAGE}"
+          test -n "${PKG_DIR}"
+          grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT"$' build.gradle.kts
+          chmod +x gradlew
+          ./gradlew --no-daemon build
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const path = `${process.env.PKG_DIR}/package.json`;
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const source = fs.readFileSync('build.gradle.kts', 'utf8');
+          const base = source.match(/^version = "(\d+\.\d+\.\d+)-SNAPSHOT"$/m)?.[1];
+          const expected = `${base}-next.${process.env.SNAPSHOT_BUILD}`;
+          const compatible = [`${base}-SNAPSHOT`, `${base}-next.0`, expected];
+          if (!base || pkg.name !== process.env.NPM_PACKAGE || !compatible.includes(pkg.version) || Object.keys(pkg.scripts ?? {}).length) {
+            throw new Error(`Unexpected npm snapshot metadata; expected ${process.env.NPM_PACKAGE} from ${base}-SNAPSHOT without lifecycle scripts`);
+          }
+          pkg.version = expected;
+          pkg.publishConfig = {...pkg.publishConfig, access: 'public', registry: 'https://registry.npmjs.org/', tag: 'next'};
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2));
+          NODE
+
+      - name: Pack and publish to next
+        env:
+          PKG_DIR: ${{ inputs.npm-package-dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/npm"
+          npm pack "./${PKG_DIR}" --ignore-scripts --pack-destination "${RUNNER_TEMP}/npm"
+          tarballs=("${RUNNER_TEMP}"/npm/*.tgz)
+          test "${#tarballs[@]}" -eq 1
+          npm publish "${tarballs[0]}" --ignore-scripts --access public --tag next --provenance
