@@ -1,0 +1,4 @@
+
+# Local Serena HTTP client wiring (localhost ports; do not commit)
+.codex/
+.grok/config.toml
