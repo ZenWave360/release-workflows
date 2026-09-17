@@ -477,6 +477,15 @@ jobs:
             exit 1
           fi
 
+          # Stable Maven versions publish to latest; prereleases stay opt-in.
+          case "${VERSION}" in
+            *-*) NPM_DIST_TAG=next ;;
+            *) NPM_DIST_TAG=latest ;;
+          esac
+          jq --arg tag "${NPM_DIST_TAG}" '.publishConfig = ((.publishConfig // {}) + {tag: $tag})' "${PKG_DIR}/package.json" > "${RUNNER_TEMP}/npm-package.json"
+          cp "${RUNNER_TEMP}/npm-package.json" "${PKG_DIR}/package.json"
+          echo "NPM_DIST_TAG=${NPM_DIST_TAG}" >> "${GITHUB_ENV}"
+
           mkdir -p "${RUNNER_TEMP}/npm"
           npm pack --ignore-scripts --pack-destination "${RUNNER_TEMP}/npm" "./${PKG_DIR}"
           TARBALL="$(basename "$(find "${RUNNER_TEMP}/npm" -type f -name '*.tgz')")"
@@ -525,7 +534,7 @@ jobs:
           # short-lived publish credential and attaches provenance
           # automatically. --ignore-scripts is defense in depth on top of the
           # scripts check above.
-          npm publish "${RUNNER_TEMP}/npm/${TARBALL}" --ignore-scripts --access public
+          npm publish "${RUNNER_TEMP}/npm/${TARBALL}" --ignore-scripts --access public --tag "${NPM_DIST_TAG}"
 
           {
             echo "### npm package published"

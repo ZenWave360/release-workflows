@@ -307,3 +307,42 @@ Only pass these explicitly as an override (e.g. a repo whose Gradle layout
 doesn't fit the single-`group =`-line assumption, or a multi-module Maven
 repo whose top-level `pom.xml` doesn't carry the coordinates you want
 checked).
+
+## npm snapshot train for Gradle callers
+
+Enable optional npm snapshots on the existing snapshot caller:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish-snapshot:
+    uses: ZenWave360/release-workflows/.github/workflows/publish-snapshots-gradle.yml@<pin-to-full-sha>
+    with:
+      publish-npm: true
+      npm-package: "@zenwave360/dsl"
+      npm-package-dir: build/js/packages/dsl-kotlin
+    # Pass the same four named Central/signing secrets as before.
+```
+
+After Maven snapshot publication succeeds, a separate npm job rebuilds/tests
+without Central/signing secrets, verifies the generated package identity and
+version, and maps Maven `1.9.0-SNAPSHOT` to immutable npm
+`1.9.0-next.RUN_NUMBER.RUN_ATTEMPT`. Each publish moves the `next` tag.
+The generated version may be the Maven snapshot version or its local `-next.0`
+equivalent; this shared workflow owns the CI version and tag.
+
+Create a secretless `npm-snapshots` environment in the caller, allowing
+`develop`/`next` without a required reviewer for automatic publishing. Add an
+npm trusted publisher for the caller repository, its snapshot workflow filename,
+and that environment. The package must first be published manually. Optional
+inputs `npm-environment` and `npm-node-version` default to `npm-snapshots`
+and Node 24. Existing callers without `publish-npm: true` keep Maven-only
+publishing. npm-enabled callers must grant `id-token: write`.
+
+The shared Gradle release workflow explicitly publishes stable `1.9.0` to
+`latest` and prereleases to `next`. Removing Maven's `-SNAPSHOT` therefore
+removes npm's prerelease suffix. It does not unpublish old npm versions or delete
+the `next` tag. npm OIDC supports publication, not `dist-tag rm`; removing
+that registry tag requires a separate authenticated operation.
