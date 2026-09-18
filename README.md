@@ -346,3 +346,28 @@ The shared Gradle release workflow explicitly publishes stable `1.9.0` to
 removes npm's prerelease suffix. It does not unpublish old npm versions or delete
 the `next` tag. npm OIDC supports publication, not `dist-tag rm`; removing
 that registry tag requires a separate authenticated operation.
+
+## Gradle npm package sets
+
+`npm-packages.yml` builds and tests through `build npmPack`, verifies the
+tarballs, runs a fresh-install smoke test, uploads them, and publishes those
+same artifacts in a separate OIDC job. It supports one package or a module set.
+The caller owns triggers, release ordering and its publisher environment.
+
+Repository helpers stay with their Gradle project: `npm-script` implements
+`version`, `verify VERSION` and `publish VERSION`, with a sibling
+`.test.mjs` file. `smoke-script` installs and exercises the packed artifacts.
+Both run with `NPM_VERSION`; snapshot version generation also receives
+`SNAPSHOT_BUILD=RUN_NUMBER.RUN_ATTEMPT`.
+
+Defaults match zenwave-manifest: `scripts/npm-packages.mjs`,
+`scripts/npm-smoke.sh`, Node 24, JDK 21 and `build/npm/*.tgz`.
+LSP sets `npm-script: scripts/npm-package.mjs`.
+`gradle-arguments` defaults to `-PuseLocalDependencies=false` for npm jobs;
+the standard main, snapshot and release Gradle workflows also accept it.
+Arguments are whitespace-separated tokens, not evaluated shell commands.
+
+Trust the top-level caller repository, workflow filename and environment in
+npm. Moving jobs here does not move publisher identity into this repository.
+No Central or npm secrets are passed to this workflow. Grant callers
+`contents: read` and `id-token: write`.

@@ -7,6 +7,10 @@ name: Verify main and publish coverage badges (Gradle, reusable)
 on:
   workflow_call:
     inputs:
+      gradle-arguments:
+        description: "Additional whitespace-separated Gradle arguments passed to every build and publish invocation"
+        type: string
+        default: ""
       java-version:
         required: false
         type: string
@@ -62,9 +66,12 @@ jobs:
           node-version: ${{ inputs.node-version }}
 
       - name: Build and test with coverage
+        env:
+          GRADLE_ARGUMENTS: ${{ inputs.gradle-arguments }}
         run: |
           chmod +x gradlew
-          ./gradlew build koverHtmlReport koverXmlReport koverLog
+          read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
+          ./gradlew build koverHtmlReport koverXmlReport koverLog "${GRADLE_ARGS[@]}"
 
       - name: Extract coverage metrics
         if: always()

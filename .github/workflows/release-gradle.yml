@@ -7,6 +7,10 @@ name: Release Gradle project (reusable)
 on:
   workflow_call:
     inputs:
+      gradle-arguments:
+        description: "Additional whitespace-separated Gradle arguments passed to every build and publish invocation"
+        type: string
+        default: ""
       version:
         description: "Semantic version to release, without a v prefix (e.g. 1.0.0 or 1.0.0-rc.1)"
         required: true
@@ -363,8 +367,10 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          ./gradlew build publishToMavenCentral
+          read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
+          ./gradlew build publishToMavenCentral "${GRADLE_ARGS[@]}"
         env:
+          GRADLE_ARGUMENTS: ${{ inputs.gradle-arguments }}
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_TOKEN }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGN_KEY }}
@@ -450,6 +456,7 @@ jobs:
 
       - name: Build and pack npm package
         env:
+          GRADLE_ARGUMENTS: ${{ inputs.gradle-arguments }}
           VERSION: ${{ needs.validate.outputs.version }}
           NPM_PACKAGE: ${{ inputs.npm-package }}
           PKG_DIR: ${{ inputs.npm-package-dir }}
@@ -460,7 +467,8 @@ jobs:
             exit 1
           fi
           chmod +x gradlew
-          ./gradlew build
+          read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
+          ./gradlew build "${GRADLE_ARGS[@]}"
 
           if [[ ! -f "${PKG_DIR}/package.json" ]]; then
             echo "::error::Generated npm package not found at ${PKG_DIR}."

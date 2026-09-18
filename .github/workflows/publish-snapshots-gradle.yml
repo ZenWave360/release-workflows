@@ -15,6 +15,10 @@ name: Publish Gradle snapshot (reusable)
 on:
   workflow_call:
     inputs:
+      gradle-arguments:
+        description: "Additional whitespace-separated Gradle arguments passed to every build and publish invocation"
+        type: string
+        default: ""
       java-version:
         required: false
         type: string
@@ -122,9 +126,12 @@ jobs:
           fi
 
       - name: Build and test with coverage
+        env:
+          GRADLE_ARGUMENTS: ${{ inputs.gradle-arguments }}
         run: |
           chmod +x gradlew
-          ./gradlew build koverHtmlReport koverXmlReport koverLog
+          read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
+          ./gradlew build koverHtmlReport koverXmlReport koverLog "${GRADLE_ARGS[@]}"
 
       - name: Extract coverage metrics
         if: always()
@@ -200,8 +207,11 @@ jobs:
       # credentials present -- that is the documented residual risk of
       # snapshot publishing.
       - name: Publish snapshots to Maven Central
-        run: ./gradlew publishToMavenCentral
+        run: |
+          read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
+          ./gradlew publishToMavenCentral "${GRADLE_ARGS[@]}"
         env:
+          GRADLE_ARGUMENTS: ${{ inputs.gradle-arguments }}
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_TOKEN }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGN_KEY }}
@@ -243,6 +253,7 @@ jobs:
 
       - name: Build and test a unique npm snapshot
         env:
+          GRADLE_ARGUMENTS: ${{ inputs.gradle-arguments }}
           SNAPSHOT_BUILD: ${{ github.run_number }}.${{ github.run_attempt }}
           NPM_PACKAGE: ${{ inputs.npm-package }}
           PKG_DIR: ${{ inputs.npm-package-dir }}
@@ -252,7 +263,8 @@ jobs:
           test -n "${PKG_DIR}"
           grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT"$' build.gradle.kts
           chmod +x gradlew
-          ./gradlew --no-daemon build
+          read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
+          ./gradlew --no-daemon build "${GRADLE_ARGS[@]}"
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
           const path = `${process.env.PKG_DIR}/package.json`;
