@@ -38,8 +38,14 @@ organization").
   sync-develop.
 - **`publish-snapshots-maven.yml`** / **`publish-snapshots-gradle.yml`** —
   single-job reusable workflows for `-SNAPSHOT` publication on push to
-  `develop`/`next`. Not secretless: the deploy step runs with all four
-  secrets present, same residual risk as `build-and-publish-central`. Each
+  `develop`/`next`. **Publishing is disabled by default** (input
+  `publish-snapshots`, default `false`) to avoid hitting Maven Central usage
+  limits: by default they only build and run the tests (`mvn verify` /
+  the Gradle build and Kover steps). Callers must pass
+  `publish-snapshots: true` to deploy to Maven Central (and, for Gradle, to
+  `publish-npm`). When publishing is enabled the workflow is not secretless:
+  the deploy step runs with all four secrets present, same residual risk as
+  `build-and-publish-central`. Each
   has no `on:` trigger of its own (reusable `workflow_call` workflows can't
   also declare `push:`/`schedule:` triggers that would fire *in this repo*)
   — the caller keeps a thin `publish-maven-snapshots.yml` with its own
@@ -255,6 +261,20 @@ jobs:
       SIGN_KEY_PASS: ${{ secrets.SIGN_KEY_PASS }}
 ```
 
+Snapshot publishing is **off by default**: the example above only builds and
+tests. To actually publish to Maven Central, add `with: publish-snapshots: true`
+(for Gradle, `publish-npm` also requires it):
+
+```yaml
+jobs:
+  publish-snapshot:
+    uses: ZenWave360/release-workflows/.github/workflows/publish-snapshots-gradle.yml@<pin-to-full-sha> # vX.Y.Z
+    with:
+      publish-snapshots: true
+    secrets:
+      # ...same four secrets as above
+```
+
 Use `publish-snapshots-maven.yml` for Maven repos instead — same shape, same
 secrets, plus a required `jacoco-csv-files` input (same list `main-maven.yml`
 uses) to print the aggregate coverage for whatever's on `develop`/`next`:
@@ -264,6 +284,7 @@ jobs:
   publish-snapshot:
     uses: ZenWave360/release-workflows/.github/workflows/publish-snapshots-maven.yml@<pin-to-full-sha> # vX.Y.Z
     with:
+      publish-snapshots: true # omit to only build and test
       jacoco-csv-files: >
         ./plugins/one-module/target/site/jacoco/jacoco.csv
         ./plugins/another-module/target/site/jacoco/jacoco.csv
