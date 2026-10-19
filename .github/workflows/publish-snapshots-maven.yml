@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: "next"
+      publish-snapshots:
+        description: "Publish the snapshot to Maven Central after build and tests. When false, the project is only built and tested."
+        required: false
+        type: boolean
+        default: false
       jacoco-csv-files:
         description: "Newline- or space-separated list of jacoco.csv paths (one per module) to compute the aggregate coverage percentage from. Defaults to the standard single-module Maven layout; multi-module repos must override with their per-module list."
         required: false
@@ -73,7 +78,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Java
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           java-version: ${{ inputs.java-version }}
           distribution: ${{ inputs.java-distribution }}
@@ -81,16 +86,25 @@ jobs:
           server-id: central
           server-username: MAVEN_USERNAME
           server-password: MAVEN_PASSWORD
+          # Maven 3.10+ only sends credentials to explicitly declared origins.
+          mvn-server-repository-origins: |
+            central:https://central.sonatype.com
 
       # Guard against accidentally publishing a release version as a snapshot.
       # Runs without secrets in the environment.
       - name: Enforce snapshot version
+        if: inputs.publish-snapshots
         run: mvn -B -ntp enforcer:enforce@enforce-snapshot-version
 
       # Secrets are scoped to this single step. Everything Maven runs here
       # (plugins, tests, dependencies) executes with the snapshot credentials
       # present -- that is the documented residual risk of snapshot publishing.
+      - name: Build and test (no publishing)
+        if: ${{ !inputs.publish-snapshots }}
+        run: mvn -B -ntp verify -Dmaven.javadoc.skip=false
+
       - name: Publish snapshot to Maven Central snapshots repository
+        if: inputs.publish-snapshots
         run: mvn -B -ntp deploy -DdeployAtEnd=true -Dmaven.javadoc.skip=false
         env:
           MAVEN_USERNAME: ${{ secrets.CENTRAL_USERNAME }}

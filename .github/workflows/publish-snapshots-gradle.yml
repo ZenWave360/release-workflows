@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: "next"
+      publish-snapshots:
+        description: "Publish the snapshot to Maven Central (and npm, if publish-npm is enabled) after build and tests. When false, the project is only built and tested."
+        required: false
+        type: boolean
+        default: false
       kover-xml-files:
         description: "Newline- or space-separated list of Kover report.xml paths (one per module) to feed the badge generator. Defaults to the standard single-module Gradle layout; multi-module repos must override with their per-module list."
         required: false
@@ -117,6 +122,7 @@ jobs:
       # Guard against accidentally publishing a release version as a snapshot.
       # Runs without secrets in the environment.
       - name: Enforce snapshot version
+        if: inputs.publish-snapshots
         run: |
           set -euo pipefail
           if ! grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+-SNAPSHOT"$' build.gradle.kts; then
@@ -207,6 +213,7 @@ jobs:
       # credentials present -- that is the documented residual risk of
       # snapshot publishing.
       - name: Publish snapshots to Maven Central
+        if: inputs.publish-snapshots
         run: |
           read -r -a GRADLE_ARGS <<< "$GRADLE_ARGUMENTS"
           ./gradlew publishToMavenCentral "${GRADLE_ARGS[@]}"
@@ -220,7 +227,7 @@ jobs:
   publish-npm-snapshot:
     name: Publish npm snapshot to next
     needs: publish-snapshot
-    if: inputs.publish-npm && (github.ref == format('refs/heads/{0}', inputs.develop-branch) || github.ref == format('refs/heads/{0}', inputs.next-branch))
+    if: inputs.publish-snapshots && inputs.publish-npm && (github.ref == format('refs/heads/{0}', inputs.develop-branch) || github.ref == format('refs/heads/{0}', inputs.next-branch))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: ${{ inputs.npm-environment }}
