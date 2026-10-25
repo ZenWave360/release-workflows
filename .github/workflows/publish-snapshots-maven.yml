@@ -45,6 +45,31 @@ on:
         required: false
         type: boolean
         default: false
+      publish-git-snapshots:
+        description: "Publish the snapshot with git-maven-publisher to a Git-hosted Maven repository (git-snapshots-repository, branch git-snapshots-branch). Independent of publish-snapshots."
+        required: false
+        type: boolean
+        default: false
+      git-snapshots-repository:
+        description: "HTTPS URL of the Git repository that holds the snapshots"
+        required: false
+        type: string
+        default: "https://github.com/zenwave360/maven-snapshots.git"
+      git-snapshots-branch:
+        description: "Branch of git-snapshots-repository that is served as a Maven repository"
+        required: false
+        type: string
+        default: "gh-pages"
+      git-snapshots-url:
+        description: "URL that serves git-snapshots-branch as a Maven repository; the git-maven-publisher plugin snapshot is resolved from it"
+        required: false
+        type: string
+        default: "https://www.zenwave360.io/maven-snapshots/"
+      git-publisher-version:
+        description: "Version of io.github.ivangsa:git-maven-publisher-maven-plugin"
+        required: false
+        type: string
+        default: "0.1.0-SNAPSHOT"
       jacoco-csv-files:
         description: "Newline- or space-separated list of jacoco.csv paths (one per module) to compute the aggregate coverage percentage from. Defaults to the standard single-module Maven layout; multi-module repos must override with their per-module list."
         required: false
@@ -59,6 +84,9 @@ on:
         required: true
       SIGN_KEY_PASS:
         required: true
+      GIT_PUBLISHER_TOKEN:
+        description: "Token with Contents: write on git-snapshots-repository; required when publish-git-snapshots is true"
+        required: false
 
 permissions:
   contents: read
@@ -93,7 +121,7 @@ jobs:
       # Guard against accidentally publishing a release version as a snapshot.
       # Runs without secrets in the environment.
       - name: Enforce snapshot version
-        if: inputs.publish-snapshots
+        if: inputs.publish-snapshots || inputs.publish-git-snapshots
         run: mvn -B -ntp enforcer:enforce@enforce-snapshot-version
 
       # Secrets are scoped to this single step. Everything Maven runs here
@@ -111,6 +139,48 @@ jobs:
           MAVEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN }}
           SIGN_KEY: ${{ secrets.SIGN_KEY }}
           SIGN_KEY_PASS: ${{ secrets.SIGN_KEY_PASS }}
+
+      # git-maven-publisher (https://github.com/ivangsa/git-maven-publisher): deploys the reactor's snapshots into a branch
+      # of a Git repository in one commit. Tests already ran in one of the two steps above, so this step only packages.
+      # The plugin snapshot is resolved from git-snapshots-url through a throwaway settings file (pluginRepository only,
+      # no servers, no credentials). The token reaches Maven only as the env GIT_PUBLISHER_TOKEN of this step; the plugin
+      # never writes it into the URL, the Git config or a log line.
+      - name: Publish snapshot to the Git repository
+        if: inputs.publish-git-snapshots
+        env:
+          GIT_PUBLISHER_TOKEN: ${{ secrets.GIT_PUBLISHER_TOKEN }}
+          GIT_SNAPSHOTS_REPOSITORY: ${{ inputs.git-snapshots-repository }}
+          GIT_SNAPSHOTS_BRANCH: ${{ inputs.git-snapshots-branch }}
+          GIT_SNAPSHOTS_URL: ${{ inputs.git-snapshots-url }}
+          GIT_PUBLISHER_VERSION: ${{ inputs.git-publisher-version }}
+        run: |
+          if [ -z "${GIT_PUBLISHER_TOKEN}" ]; then
+            echo "::error::publish-git-snapshots is true but the GIT_PUBLISHER_TOKEN secret is not set in environment ${{ inputs.snapshot-environment }}"
+            exit 1
+          fi
+          settings="${RUNNER_TEMP}/git-publisher-settings.xml"
+          cat > "${settings}" <<EOF
+          <settings>
+            <profiles>
+              <profile>
+                <id>git-publisher</id>
+                <pluginRepositories>
+                  <pluginRepository>
+                    <id>git-maven-snapshots</id>
+                    <url>${GIT_SNAPSHOTS_URL}</url>
+                    <releases><enabled>false</enabled></releases>
+                    <snapshots><enabled>true</enabled><updatePolicy>always</updatePolicy></snapshots>
+                  </pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>git-publisher</activeProfile></activeProfiles>
+          </settings>
+          EOF
+          mvn -B -ntp -s "${settings}" package -DskipTests \
+            "io.github.ivangsa:git-maven-publisher-maven-plugin:${GIT_PUBLISHER_VERSION}:deploy" \
+            "-Dgit-publisher.repository=${GIT_SNAPSHOTS_REPOSITORY}" \
+            "-Dgit-publisher.branch=${GIT_SNAPSHOTS_BRANCH}"
 
       # No secrets in this step's env. Only computes the aggregate coverage
       # percentage from the jacoco.csv files the deploy step's test run just
