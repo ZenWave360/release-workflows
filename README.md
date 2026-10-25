@@ -235,6 +235,11 @@ jobs:
 
 ## Example caller: snapshot publication
 
+Maven callers can also publish snapshots to `zenwave360/maven-snapshots` (branch `gh-pages`) with
+[git-maven-publisher](https://github.com/ivangsa/git-maven-publisher): pass `publish-git-snapshots: true` and the secret
+`GIT_PUBLISHER_TOKEN: ${{ secrets.GIT_PUBLISHER_TOKEN }}` (an org secret of ZenWave360). To regenerate that token, see
+[docs/git-publisher-token.md](docs/git-publisher-token.md).
+
 ```yaml
 # .github/workflows/publish-maven-snapshots.yml
 name: Build and Publish Snapshots
