@@ -54,7 +54,7 @@ gh run rerun --repo ZenWave360/zenwave-sdk $(gh run list --repo ZenWave360/zenwa
 
 ## Notes
 
-- Branch `gh-pages` of `zenwave360/maven-snapshots` must not block force pushes: every publication replaces the
+- Branch `main` of `zenwave360/maven-snapshots` must not block force pushes (its ruleset only blocks deletion): every publication replaces the
   branch with one commit, using a force push with lease.
 - If the org requires approval for fine-grained tokens, approve the request at
   https://github.com/organizations/zenwave360/settings/personal-access-token-requests after step 1.

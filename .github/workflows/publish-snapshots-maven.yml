@@ -59,12 +59,12 @@ on:
         description: "Branch of git-snapshots-repository that is served as a Maven repository"
         required: false
         type: string
-        default: "gh-pages"
+        default: "main"
       git-snapshots-url:
         description: "URL that serves git-snapshots-branch as a Maven repository; the git-maven-publisher plugin snapshot is resolved from it"
         required: false
         type: string
-        default: "https://www.zenwave360.io/maven-snapshots/"
+        default: "https://raw.githubusercontent.com/zenwave360/maven-snapshots/main/"
       git-publisher-version:
         description: "Version of io.github.ivangsa:git-maven-publisher-maven-plugin"
         required: false
