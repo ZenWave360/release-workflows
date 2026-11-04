@@ -352,8 +352,10 @@ jobs:
     # Pass the same four named Central/signing secrets as before.
 ```
 
-After Maven snapshot publication succeeds, a separate npm job rebuilds/tests
-without Central/signing secrets, verifies the generated package identity and
+After the snapshot build and tests pass on `develop` or `next`, a separate npm
+job publishes to `next`, whether the Maven snapshot went to Central
+(`publish-snapshots`), to the Git repository (`publish-git-snapshots`), or
+nowhere. It rebuilds/tests without Central/signing secrets, verifies the generated package identity and
 version, and maps Maven `1.9.0-SNAPSHOT` to immutable npm
 `1.9.0-next.RUN_NUMBER.RUN_ATTEMPT`. Each publish moves the `next` tag.
 The generated version may be the Maven snapshot version or its local `-next.0`

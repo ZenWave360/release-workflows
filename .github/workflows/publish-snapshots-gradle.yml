@@ -45,7 +45,7 @@ on:
         type: string
         default: "next"
       publish-snapshots:
-        description: "Publish the snapshot to Maven Central (and npm, if publish-npm is enabled) after build and tests. When false, the project is only built and tested."
+        description: "Also publish the snapshot to Maven Central. Independent of publish-git-snapshots and of npm."
         required: false
         type: boolean
         default: false
@@ -80,7 +80,7 @@ on:
         type: string
         default: "./build/reports/kover/report.xml"
       publish-npm:
-        description: "Publish a unique npm prerelease to next after Maven snapshot publication"
+        description: "Publish a unique npm prerelease to next on every develop or next build, whichever Maven snapshot repositories are used"
         required: false
         type: boolean
         default: false
@@ -301,7 +301,7 @@ jobs:
   publish-npm-snapshot:
     name: Publish npm snapshot to next
     needs: publish-snapshot
-    if: inputs.publish-snapshots && inputs.publish-npm && (github.ref == format('refs/heads/{0}', inputs.develop-branch) || github.ref == format('refs/heads/{0}', inputs.next-branch))
+    if: inputs.publish-npm && (github.ref == format('refs/heads/{0}', inputs.develop-branch) || github.ref == format('refs/heads/{0}', inputs.next-branch))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: ${{ inputs.npm-environment }}
